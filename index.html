@@ -559,6 +559,16 @@
         .context-menu-item.delete{color:var(--red);}
 
         /* ── TOAST ── */
+        .update-bar{
+            position:fixed;left:12px;right:12px;bottom:calc(14px + var(--safe-b));z-index:9000;
+            max-width:520px;margin:0 auto;display:flex;align-items:center;gap:10px;
+            padding:10px 10px 10px 16px;border-radius:14px;
+            background:var(--surface);border:1px solid var(--border);box-shadow:var(--shadow-lg);
+            font-size:14px;font-weight:600;color:var(--text);animation:popIn 0.25s var(--ease);
+        }
+        .update-bar span{flex:1;}
+        .update-bar button{border:none;border-radius:10px;padding:9px 16px;font-weight:700;cursor:pointer;background:var(--accent);color:#fff;}
+        .update-bar .ub-close{background:none;color:var(--text-2);padding:6px 8px;font-size:20px;}
         .toast{
             position:fixed;left:50%;bottom:calc(24px + var(--safe-b));z-index:10000;
             transform:translate(-50%,20px);opacity:0;pointer-events:none;
@@ -676,6 +686,8 @@ async function dbSet(key,value){
 // Older English File documents stored their first image twice ("data" + images[0]).
 // Drop the duplicate once to save space; documents with only "data" are left as they are.
 function removeDuplicateDocImages(){
+    if(cacheGet('docDupCleaned'))return;  // runs once — parsing every document image on each start is slow
+    dbSet('docDupCleaned','1').catch(console.error);
     const folders=getArr('englishFile_folders');
     let changed=false;
     folders.forEach(f=>(f.documents||[]).forEach(d=>{
@@ -1059,11 +1071,20 @@ ${cfg.btn?`<button class="new-entry-btn" onclick="handleNewEntry()">＋ ${cfg.bt
     updateDate();
 }
 function updateDate(){const el=document.getElementById('currentDate');if(el)el.textContent=new Date().toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'});}
+// Document/case totals are remembered next to the data (keyed by its size), so the
+// dashboard doesn't have to parse megabytes of images just to show a number
+function folderItemCount(key,field){
+    const raw=cacheGet(key)||'[]',metaKey='meta_'+key;
+    try{const m=JSON.parse(cacheGet(metaKey)||'null');if(m&&m.len===raw.length)return m.count;}catch(e){}
+    const count=getArr(key).reduce((n,f)=>n+(f[field]||[]).length,0);
+    dbSet(metaKey,JSON.stringify({len:raw.length,count})).catch(console.error);
+    return count;
+}
 function loadCounts(){
     const counts={};
     DATA_KEYS.forEach(k=>{if(!k.endsWith('_folders'))counts[k]=getArr(k).length;});
-    counts.englishFile=getArr('englishFile_folders').reduce((n,f)=>n+(f.documents||[]).length,0);
-    counts.record=getArr('record_folders').reduce((n,f)=>n+(f.cases||[]).length,0);
+    counts.englishFile=folderItemCount('englishFile_folders','documents');
+    counts.record=folderItemCount('record_folders','cases');
     document.querySelectorAll('#mainDashboard [data-count]').forEach(card=>{
         const key=card.dataset.count,v=counts[key]||0;
         const el=document.getElementById('count-'+key);if(el)el.textContent=v;
@@ -2326,7 +2347,18 @@ function handleImportFile(e){
 // ============================================================
 //  SERVICE WORKER
 // ============================================================
+// The app opens instantly from the phone's saved copy; a newer version is downloaded
+// in the background and the user is offered a one-tap update.
+function showUpdateBar(){
+    if(document.getElementById('updateBar'))return;
+    const bar=document.createElement('div');
+    bar.id='updateBar';bar.className='update-bar';bar.setAttribute('role','status');
+    bar.innerHTML='<span>🔄 A new version of the app is ready</span><button onclick="location.reload()">Update</button><button class="ub-close" onclick="this.parentElement.remove()" aria-label="Later">×</button>';
+    document.body.appendChild(bar);
+}
 if('serviceWorker' in navigator){
+    navigator.serviceWorker.addEventListener('message',e=>{if(e.data&&e.data.type==='APP_UPDATED')showUpdateBar();});
+    navigator.serviceWorker.startMessages();  // receive messages sent while the page is still loading
     window.addEventListener('load',()=>{
         navigator.serviceWorker.register('/sw.js').catch(err=>console.warn('SW registration failed:',err));
     });
