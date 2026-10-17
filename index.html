@@ -156,7 +156,21 @@
             border-radius:var(--radius);
             box-shadow:var(--shadow);
         }
-        .view-header{position:sticky;top:var(--safe-t);z-index:20;}
+        /* Header + search stick to the top together on a solid band, so list
+           content scrolls underneath instead of half-hiding the search bar */
+        .sticky-top{
+            /* sticky offset is measured from the container's padding edge, so pull
+               the band up by that padding to cover the status-bar gap completely */
+            position:sticky;top:calc(-14px - var(--safe-t));z-index:20;
+            margin:calc(-14px - var(--safe-t)) -14px 4px;
+            padding:calc(14px + var(--safe-t)) 14px 10px;
+            background:var(--bg);
+            box-shadow:0 0 0 100vmax var(--bg);clip-path:inset(0 -100vmax -14px);  /* extend band full width */
+        }
+        /* soft fade under the band instead of a hard edge */
+        .sticky-top::after{content:'';position:absolute;left:0;right:0;bottom:-14px;height:14px;background:linear-gradient(var(--bg),transparent);pointer-events:none;}
+        .sticky-top .view-header{margin-bottom:0;}
+        .sticky-top .search-container{margin:12px 0 0;}
         .header-content{flex:1;min-width:0;}
         .header-content h1{font-size:19px;font-weight:750;letter-spacing:-0.3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
         .header-content .date{font-size:12.5px;color:var(--text-2);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
@@ -908,6 +922,15 @@ function showDashboard(){
     void d.offsetHeight;
     d.style.opacity='';
 }
+// Group the view header (and the search box right after it) into one sticky band
+function makeStickyTop(root){
+    const hdr=root.querySelector('.view-header');
+    if(!hdr||hdr.parentElement.classList.contains('sticky-top'))return;
+    const band=document.createElement('div');band.className='sticky-top';
+    hdr.before(band);band.append(hdr);
+    const next=band.nextElementSibling;
+    if(next&&next.classList.contains('search-container'))band.append(next);
+}
 function renderDetail(html,{listType=null,keepScroll=false}={}){
     const dv=document.getElementById('detailView');
     const top=dv.scrollTop;
@@ -917,6 +940,7 @@ function renderDetail(html,{listType=null,keepScroll=false}={}){
     dv._screen=screen;
     curDetailType=listType;
     dv.innerHTML=`<div class="wrap">${html}</div>`;
+    makeStickyTop(dv);
     dv.scrollTop=keepScroll?top:0;
     hideDashboard();pageShow(dv);
     return dv;
@@ -1140,6 +1164,7 @@ function renderForm(){
 <header class="header view-header"><button class="back-btn" onclick="goBack()" aria-label="Back">←</button><div class="header-content"><h1>${title}</h1><div class="date">${sub}</div></div></header>
 <div class="form-section">${fields}</div>
 <div class="form-actions"><button class="cancel-btn" onclick="goBack()">Cancel</button><button class="save-btn" id="saveBtn" onclick="saveEntry()">Save Entry 💾</button></div></div>`;
+    makeStickyTop(document.getElementById('formContainer'));
     setupCamListener();
 }
 function selectField(id,lbl,opts,selected=''){
