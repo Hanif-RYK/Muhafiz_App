@@ -165,10 +165,14 @@
             margin:calc(-14px - var(--safe-t)) -14px 4px;
             padding:calc(14px + var(--safe-t)) 14px 10px;
             background:var(--bg);
-            box-shadow:0 0 0 100vmax var(--bg);clip-path:inset(0 -100vmax -14px);  /* extend band full width */
         }
-        /* soft fade under the band instead of a hard edge */
-        .sticky-top::after{content:'';position:absolute;left:0;right:0;bottom:-14px;height:14px;background:linear-gradient(var(--bg),transparent);pointer-events:none;}
+        /* extend the band's background to the full screen width (sideways only —
+           nothing is painted below the band, so the first card is never covered) */
+        .sticky-top::before{content:'';position:absolute;top:0;bottom:0;left:-100vmax;right:-100vmax;background:var(--bg);z-index:-1;pointer-events:none;}
+        /* soft fade under the band — only while content is scrolled under it,
+           so it never covers the top of the first card */
+        .sticky-top::after{content:'';position:absolute;left:-100vmax;right:-100vmax;bottom:-14px;height:14px;background:linear-gradient(var(--bg),transparent);pointer-events:none;opacity:0;transition:opacity 0.15s;}
+        .sticky-top.scrolled::after{opacity:1;}
         .sticky-top .view-header{margin-bottom:0;}
         .sticky-top .search-container{margin:12px 0 0;}
         .header-content{flex:1;min-width:0;}
@@ -302,7 +306,7 @@
         .form-container,.detail-view{
             position:fixed;inset:0;
             background-color:var(--bg);background-image:var(--bg-gradient);
-            overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;
+            overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;
             padding:calc(14px + var(--safe-t)) 14px calc(28px + var(--safe-b));
             opacity:0;pointer-events:none;visibility:hidden;
             transition:opacity 0.18s ease,visibility 0s linear 0.18s;
@@ -930,6 +934,10 @@ function makeStickyTop(root){
     hdr.before(band);band.append(hdr);
     const next=band.nextElementSibling;
     if(next&&next.classList.contains('search-container'))band.append(next);
+    // Show the fade only once the list has scrolled under the band
+    const sync=()=>{const b=root.querySelector('.sticky-top');if(b)b.classList.toggle('scrolled',root.scrollTop>4);};
+    if(!root._stickyScroll){root._stickyScroll=true;root.addEventListener('scroll',sync,{passive:true});}
+    requestAnimationFrame(sync);
 }
 function renderDetail(html,{listType=null,keepScroll=false}={}){
     const dv=document.getElementById('detailView');
