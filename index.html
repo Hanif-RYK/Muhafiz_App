@@ -300,6 +300,9 @@
         .bb-actions button{flex:1;padding:10px;border-radius:10px;font-weight:700;font-size:14px;cursor:pointer;}
         .bb-primary{background:var(--accent);color:#fff;border:none;}
         .bb-later{background:var(--surface);color:var(--text);border:1px solid var(--border);}
+        .menu-badge{margin-left:auto;font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:999px;background:var(--surface-2);color:var(--text-2);}
+        .menu-badge.on{background:var(--green-soft);color:var(--green);}
+        .menu-badge.off{background:var(--red-soft);color:var(--red);}
         .sidebar-footer{margin-top:auto;padding:14px 20px;font-size:11.5px;color:var(--text-3);text-align:center;}
 
         /* ── FULL-SCREEN VIEWS ── */
@@ -975,12 +978,14 @@ document.addEventListener('DOMContentLoaded',async()=>{
     try{
         await dbLoadAll();
         applyTheme();loadSettings();renderDashboard();renderSidebar();
-        await runOverdueChecks();
+        await runOverdueChecks(true);
         loadCounts();
-        setInterval(runOverdueChecks,30000);
+        setInterval(()=>runOverdueChecks(true),30000);
         setInterval(()=>{refreshTimers();updateDate();},30000);
         setupGlobalListeners();
         requestPersistentStorage();
+        const openParam=new URLSearchParams(location.search).get('open');
+        if(openParam){history.replaceState(null,'',location.pathname);openOverdueList(openParam);}
         OBSOLETE_KEYS.forEach(k=>{if(k in _cache)dbDelete(k).catch(console.error);});
         removeDuplicateDocImages();
         setupInstall();
@@ -997,7 +1002,7 @@ function setupGlobalListeners(){
     document.addEventListener('click',e=>{if(!e.target.closest('.context-menu'))hideCtxMenu();});
     document.addEventListener('scroll',hideCtxMenu,true);
     document.addEventListener('visibilitychange',()=>{
-        if(document.visibilityState==='visible'){runOverdueChecks();refreshTimers();updateDate();}
+        if(document.visibilityState==='visible'){runOverdueChecks(true);refreshTimers();updateDate();}
     });
     document.addEventListener('keydown',e=>{
         if(e.key!=='Escape')return;
@@ -1130,6 +1135,10 @@ function renderSidebar(){
         <span class="sb-section-title">App</span>
         <button class="menu-item" onclick="installApp()">📲 Install App</button>
     </div>
+    <div class="sb-section" id="alertsSection"${NOTIF_OK?'':' hidden'}>
+        <span class="sb-section-title">Alerts</span>
+        <button class="menu-item" onclick="openAlertSettings()">🔔 Overdue Alerts <span class="menu-badge" id="alertState">${alertStateLabel()}</span></button>
+    </div>
     <div class="sb-section">
         <span class="sb-section-title">Security</span>
         <button class="menu-item" onclick="openChangePin()">🔒 Change PIN</button>
@@ -1140,7 +1149,7 @@ function renderSidebar(){
         <button class="menu-item" onclick="importData()">📥 Restore Backup</button>
     </div>
     <div class="sidebar-footer">Data is stored on this device only.<br><span id="lastBackupText">${lastBackupText()}</span></div>`;
-    updateMenuSel();updateThemeButtons();
+    updateMenuSel();updateThemeButtons();updateAlertState();
 }
 function openSidebar(){
     const m=document.getElementById('sidebarMenu');
@@ -1345,7 +1354,7 @@ async function persistEntry(key,entry,msg){
         ok=true;
     }catch(e){toast('Save failed: '+e.message,'error');}
     finally{hideLoading();}
-    if(ok){loadCounts();toast('✓ '+msg,'success');goBack();}
+    if(ok){loadCounts();toast('✓ '+msg,'success');goBack();setTimeout(maybeAskForAlerts,900);}
 }
 async function saveTask(){
     const tt=gv('taskType'),td=gv('taskDetails'),at=gv('assignedTo');
@@ -1379,16 +1388,18 @@ async function saveFileMov(){
 async function checkOverdue(sk,ok){
     const now=Date.now(),still=[],newly=[];
     getArr(sk).forEach(i=>{(new Date(i.expiresAt).getTime()<now?newly:still).push(i);});
-    if(!newly.length)return false;
+    if(!newly.length)return[];
     await Promise.all([setArr(sk,still),setArr(ok,getArr(ok).concat(newly))]);
-    return true;
+    return newly.map(item=>({item,key:ok}));
 }
-async function runOverdueChecks(){
+// alert=true: tell the user about entries that just became overdue (not used for imports)
+async function runOverdueChecks(alert=false){
     try{
-        const moved=await Promise.all(OVERDUE_PAIRS.map(([a,b])=>checkOverdue(a,b)));
-        if(moved.some(Boolean)){
+        const moved=(await Promise.all(OVERDUE_PAIRS.map(([a,b])=>checkOverdue(a,b)))).flat();
+        if(moved.length){
             loadCounts();
             if(curDetailType&&OVERDUE_PAIRS.some(p=>p.includes(curDetailType)))refreshDetail();
+            if(alert)alertOverdue(moved);
         }
     }catch(e){console.error('Overdue check failed',e);}
 }
@@ -2178,6 +2189,121 @@ function shareRecordCase(fi,ci){
 }
 
 // ============================================================
+//  OVERDUE ALERTS — while the app is open (in front or in the background)
+// ============================================================
+const NOTIF_OK='Notification' in window&&'serviceWorker' in navigator;
+const OVERDUE_WHAT={overdueFiles:'file',overdueTasks:'task',materialsOverdue:'material'};
+function alertStateLabel(){
+    if(!NOTIF_OK)return'';
+    return Notification.permission==='granted'?'On':Notification.permission==='denied'?'Blocked':'Off';
+}
+function updateAlertState(){
+    const el=document.getElementById('alertState');if(!el||!NOTIF_OK)return;
+    el.textContent=alertStateLabel();
+    el.className='menu-badge '+(Notification.permission==='granted'?'on':'off');
+}
+// Short two-tone chime. Browsers only allow sound after the user has tapped the page,
+// so the audio engine is unlocked on the first tap.
+let _audio=null;
+document.addEventListener('pointerdown',()=>{
+    if(_audio)return;
+    try{_audio=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}
+},{once:true,capture:true});
+function playChime(){
+    if(!_audio)return;
+    try{
+        if(_audio.state==='suspended')_audio.resume();
+        const t=_audio.currentTime;
+        [[880,0],[660,0.22],[880,0.44]].forEach(([f,d])=>{
+            const o=_audio.createOscillator(),g=_audio.createGain();
+            o.type='sine';o.frequency.value=f;
+            g.gain.setValueAtTime(0.0001,t+d);g.gain.exponentialRampToValueAtTime(0.35,t+d+0.02);g.gain.exponentialRampToValueAtTime(0.0001,t+d+0.2);
+            o.connect(g).connect(_audio.destination);o.start(t+d);o.stop(t+d+0.22);
+        });
+    }catch(e){}
+}
+function overdueLine({item,key}){
+    const what=OVERDUE_WHAT[key]||'entry';
+    const title=item.title&&item.title!=='Image Captured'?` (${item.title})`:item.taskType?` (${label(item.taskType)})`:'';
+    return key==='overdueTasks'?`${item.name||'Task'}${title} — deadline has passed`:`${item.name||'Someone'}${title} — return the ${what}`;
+}
+let _pendingAlerts=[];
+document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState==='visible'&&_pendingAlerts.length){const m=_pendingAlerts;_pendingAlerts=[];alertOverdue(m);}
+});
+// Called with the entries that just became overdue
+async function alertOverdue(moved){
+    const first=moved[0],what=OVERDUE_WHAT[first.key]||'entry';
+    const title=moved.length===1?`⏰ ${what[0].toUpperCase()+what.slice(1)} overdue`:`⏰ ${moved.length} entries overdue`;
+    const body=moved.slice(0,3).map(overdueLine).join('\n')+(moved.length>3?`\n+${moved.length-3} more`:'');
+    const openKey=moved.every(m=>m.key===first.key)?first.key:'overdueFiles';
+    if(document.visibilityState==='visible'){
+        // App on screen: in-app alert + chime + vibration
+        playChime();
+        if(navigator.vibrate)navigator.vibrate([250,120,250]);
+        if(document.getElementById('entryPopup').classList.contains('active')||document.getElementById('confirmPopup').classList.contains('active')){
+            toast(title+' — '+overdueLine(first),'error');return;
+        }
+        showEntryPopup(`<div style="text-align:center"><div style="font-size:44px;margin-bottom:6px">⏰</div><h2 class="popup-title">${esc(title.replace(/^⏰\s*/,''))}</h2></div>
+<div class="kv">${moved.slice(0,5).map(m=>`<div class="kv-row"><strong style="text-align:left">${esc(overdueLine(m))}</strong></div>`).join('')}${moved.length>5?`<div class="kv-row"><span>+${moved.length-5} more</span></div>`:''}</div>
+<div class="popup-actions"><button class="popup-cancel" onclick="closePopup()">OK</button><button class="popup-confirm" onclick="closePopup();openOverdueList('${openKey}')">View</button></div>`,false);
+        return;
+    }
+    // App in the background: phone notification (the phone plays its notification tone).
+    // Without permission, keep them and show the in-app alert when the user comes back.
+    if(!NOTIF_OK||Notification.permission!=='granted'){_pendingAlerts.push(...moved);return;}
+    try{
+        const reg=await navigator.serviceWorker.ready;
+        await reg.showNotification(title,{body,icon:'icon-192.png',badge:'icon-192.png',tag:'overdue-'+Date.now(),
+            renotify:true,requireInteraction:true,vibrate:[250,120,250],data:{openKey}});
+    }catch(e){console.warn('Notification failed',e);}
+}
+// Open the right dashboard + overdue list (from the alert popup or a notification tap)
+function openOverdueList(key){
+    if(!OVERDUE_TYPES.includes(key))key='overdueFiles';
+    closeTopOverlay();
+    const mode=key==='overdueTasks'?['office','assignedTask']:key==='materialsOverdue'?['office','picture']:['fileMovement',curMode==='fileMovement'?curType:'picture'];
+    if(navStack.length)closeAllViews();
+    selectMode(mode[0],mode[1]);
+    openDetailView(key);
+}
+async function requestAlerts(){
+    if(!NOTIF_OK)return;
+    try{await Notification.requestPermission();}catch(e){}
+    updateAlertState();
+    if(Notification.permission==='granted'){
+        toast('🔔 Overdue alerts are on','success');
+        try{(await navigator.serviceWorker.ready).showNotification('🔔 Muhafiz alerts are on',{body:'You will be notified when a file, material or task becomes overdue while the app is open.',icon:'icon-192.png',badge:'icon-192.png',tag:'alerts-on'});}catch(e){}
+    }else if(Notification.permission==='denied')toast('Notifications are blocked — enable them in phone settings','error');
+}
+// Ask once, right after the first entry is saved (a natural moment, and a user action)
+function maybeAskForAlerts(){
+    if(!NOTIF_OK||Notification.permission!=='default'||cacheGet('alertsAsked'))return;
+    if(document.getElementById('entryPopup').classList.contains('active'))return;
+    dbSet('alertsAsked','1').catch(console.error);
+    showEntryPopup(`<div style="text-align:center"><div style="font-size:44px;margin-bottom:6px">🔔</div><h2 class="popup-title">Turn on overdue alerts?</h2></div>
+<p class="popup-sub">Get a notification and tone when a file, material or task becomes overdue while the app is open.</p>
+<div class="popup-actions"><button class="popup-cancel" onclick="closePopup()">Not now</button><button class="popup-confirm" onclick="closePopup();requestAlerts()">Turn on</button></div>`,false);
+}
+function openAlertSettings(){
+    closeSidebar();
+    if(Notification.permission==='default'){requestAlerts();return;}
+    const on=Notification.permission==='granted';
+    showEntryPopup(`<div style="text-align:center"><div style="font-size:44px;margin-bottom:6px">${on?'🔔':'🔕'}</div><h2 class="popup-title">Overdue Alerts: ${on?'On':'Blocked'}</h2></div>
+${on?`<p class="popup-sub">When an entry becomes overdue:<br>• App on screen → alert with tone &amp; vibration<br>• App in background → phone notification</p>
+<p class="popup-sub"><strong>Note:</strong> if the app is fully closed, alerts appear the next time you open it.</p>
+<div class="popup-actions"><button class="popup-cancel" onclick="closePopup()">Close</button><button class="popup-confirm" onclick="testAlert()">Test alert</button></div>`
+:`<p class="popup-sub">Notifications were blocked for this app. To turn them on:</p>
+<div class="kv"><div class="kv-row"><span>1.</span><strong>Phone Settings → Apps → Muhafiz (or Chrome)</strong></div><div class="kv-row"><span>2.</span><strong>Notifications → Allow</strong></div></div>
+<div class="popup-actions"><button class="popup-confirm" onclick="closePopup()">OK</button></div>`}`,false);
+}
+async function testAlert(){
+    closePopup();
+    playChime();if(navigator.vibrate)navigator.vibrate([250,120,250]);
+    try{(await navigator.serviceWorker.ready).showNotification('⏰ Test: File overdue',{body:'This is how an overdue alert looks.',icon:'icon-192.png',badge:'icon-192.png',tag:'test',vibrate:[250,120,250],data:{openKey:'overdueFiles'}});}catch(e){toast('Could not show notification','error');}
+}
+
+// ============================================================
 //  INSTALL APP (PWA)
 // ============================================================
 // True when running as an installed app (home-screen PWA, fullscreen, or Play Store TWA)
@@ -2357,7 +2483,11 @@ function showUpdateBar(){
     document.body.appendChild(bar);
 }
 if('serviceWorker' in navigator){
-    navigator.serviceWorker.addEventListener('message',e=>{if(e.data&&e.data.type==='APP_UPDATED')showUpdateBar();});
+    navigator.serviceWorker.addEventListener('message',e=>{
+        if(!e.data)return;
+        if(e.data.type==='APP_UPDATED')showUpdateBar();
+        if(e.data.type==='OPEN_OVERDUE')openOverdueList(e.data.key);
+    });
     navigator.serviceWorker.startMessages();  // receive messages sent while the page is still loading
     window.addEventListener('load',()=>{
         navigator.serviceWorker.register('/sw.js').catch(err=>console.warn('SW registration failed:',err));

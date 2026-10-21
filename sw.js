@@ -1,9 +1,9 @@
-// Muhafiz Service Worker v3
+// Muhafiz Service Worker v4
 // - App page (HTML): served instantly from cache, then refreshed from the network in
 //   the background. If a newer version was downloaded, open pages are told so they
 //   can offer an "Update" button. Opening the app never waits for the internet.
 // - Static assets: stale-while-revalidate.
-const CACHE_NAME = 'muhafiz-v3';
+const CACHE_NAME = 'muhafiz-v4';
 const ASSETS = [
   '/',
   '/index.html',
@@ -87,4 +87,20 @@ self.addEventListener('fetch', e => {
       return cached || network;
     })
   );
+});
+
+// Tapping an overdue notification opens (or focuses) the app on the overdue list
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  const key = (e.notification.data && e.notification.data.openKey) || 'overdueFiles';
+  e.waitUntil((async () => {
+    const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    if (wins.length) {
+      const w = wins[0];
+      await w.focus();
+      w.postMessage({ type: 'OPEN_OVERDUE', key });
+    } else {
+      await self.clients.openWindow('/?open=' + encodeURIComponent(key));
+    }
+  })());
 });
