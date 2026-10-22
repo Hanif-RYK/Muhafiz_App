@@ -212,9 +212,8 @@
         @media (hover:hover){.card:hover{transform:translateY(-1px);box-shadow:var(--shadow-lg);}}
         .card-content h2{font-size:12.5px;color:var(--text-2);font-weight:650;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;}
         .card-content .count{font-size:36px;font-weight:800;line-height:1;color:var(--c);font-variant-numeric:tabular-nums;}
-        .card-icon{width:52px;height:52px;border-radius:14px;display:grid;place-items:center;font-size:24px;background:var(--c-soft);flex-shrink:0;}
+        .card-icon{width:52px;height:52px;border-radius:14px;display:grid;place-items:center;font-size:24px;background:var(--c-soft);flex-shrink:0;position:relative;isolation:isolate;}
         /* Pulse animates only opacity (GPU) instead of box-shadow (repaints every frame) */
-        .card-icon{position:relative;isolation:isolate;}
         .card.has-alert .card-icon::after{
             content:'';position:absolute;inset:-7px;border-radius:18px;background:var(--red-soft);
             z-index:-1;opacity:0;animation:alertPulse 2s ease-in-out infinite;will-change:opacity;
@@ -309,7 +308,7 @@
         .form-container,.detail-view{
             position:fixed;inset:0;
             background-color:var(--bg);background-image:var(--bg-gradient);
-            overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;
+            overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;
             padding:calc(14px + var(--safe-t)) 14px calc(28px + var(--safe-b));
             opacity:0;pointer-events:none;visibility:hidden;
             transition:opacity 0.18s ease,visibility 0s linear 0.18s;
@@ -409,6 +408,7 @@
             transition:opacity 0.2s ease,transform 0.2s ease,height 0.25s var(--ease),margin 0.25s var(--ease),padding 0.25s var(--ease);
         }
         .file-item{
+            content-visibility:auto;contain-intrinsic-size:auto 290px;  /* skip drawing cards that are off screen */
             background:var(--surface);border:1px solid var(--border);
             border-radius:16px;margin-bottom:12px;box-shadow:var(--shadow);overflow:hidden;
         }
@@ -481,6 +481,7 @@
             background:var(--surface);border-radius:12px;overflow:hidden;box-shadow:var(--shadow-sm);
         }
         .gallery-img img{display:block;width:100%;height:auto;}
+        .gallery-img img:not([src]){aspect-ratio:3/4;background:var(--surface-2);}  /* placeholder until the photo loads */
         .long-press-hint{font-size:11.5px;color:var(--text-3);margin-top:8px;text-align:center;}
 
         /* ── EMPTY STATE ── */
@@ -588,7 +589,18 @@
             position:fixed;inset:0;background:rgba(0,10,30,0.6);
             z-index:9999;display:none;justify-content:center;align-items:center;flex-direction:column;
         }
-        .loading-overlay.show{display:flex;}
+        .loading-overlay.show{display:flex;animation:fadeIn 0.2s ease;}
+        body.busy .wrap,body.busy .popup,body.busy .sidebar-menu{pointer-events:none;}
+        /* closing popup / photo preview: a copy fades out (see fadeOutCopy) */
+        .fading-out{pointer-events:none!important;animation:fadeOut 0.18s ease forwards!important;}
+        .fading-out .popup-content{animation:popOut 0.18s var(--ease) forwards!important;}
+        @keyframes fadeOut{to{opacity:0;}}
+        @keyframes popOut{to{opacity:0;transform:translateY(8px) scale(0.97);}}
+        /* gentle transition when one screen replaces another */
+        .screen-in{animation:screenIn 0.2s var(--ease);}
+        @keyframes screenIn{from{opacity:0.35;transform:translateY(8px);}to{opacity:1;transform:none;}}
+        /* "Update": fade the current screen to the background before the new version loads */
+        body.leaving>*{opacity:0!important;transition:opacity 0.18s ease!important;}
         .loading-spinner{
             width:46px;height:46px;margin-bottom:14px;border-radius:50%;
             border:3px solid rgba(255,255,255,0.2);border-top-color:rgba(255,255,255,0.95);
@@ -657,8 +669,6 @@
 const DB_NAME='MuhafizDB',DB_VER=1,STORE='appData';
 const DATA_KEYS=['filesOut','overdueFiles','returnedFiles','pendingTasks','overdueTasks','completedTasks',
     'materialsOut','materialsOverdue','materialsReturned','englishFile_folders','bailBonds','record_folders'];
-// Removed "Processing" feature — its old data is cleaned up once at startup
-const OBSOLETE_KEYS=['processPending','processOverdue','processServed'];
 const DEFAULT_PIN='0000';  // used until the user sets their own PIN
 let _db=null;
 const _cache={};  // sync read cache populated at startup
@@ -686,28 +696,20 @@ async function dbSet(key,value){
         tx.onabort=()=>rej(tx.error||new Error('Storage transaction aborted'));
     });
 }
-// Older English File documents stored their first image twice ("data" + images[0]).
-// Drop the duplicate once to save space; documents with only "data" are left as they are.
-function removeDuplicateDocImages(){
-    if(cacheGet('docDupCleaned'))return;  // runs once — parsing every document image on each start is slow
-    dbSet('docDupCleaned','1').catch(console.error);
-    const folders=getArr('englishFile_folders');
-    let changed=false;
-    folders.forEach(f=>(f.documents||[]).forEach(d=>{
-        if(Array.isArray(d.images)&&d.images.length&&'data' in d){delete d.data;changed=true;}
-    }));
-    if(changed)setArr('englishFile_folders',folders).catch(console.error);
-}
 function dbDelete(key){
     delete _cache[key];
     return openDB().then(db=>new Promise(res=>{const tx=db.transaction(STORE,'readwrite');tx.objectStore(STORE).delete(key);tx.oncomplete=tx.onerror=()=>res();}));
 }
 async function dbLoadAll(){
     const db=await openDB();
+    // Everything except photo records ("img:…"): photos are only read when viewed
     const all=await new Promise(res=>{
-        const r=db.transaction(STORE,'readonly').objectStore(STORE).getAll();
-        r.onsuccess=()=>res(r.result||[]);
-        r.onerror=()=>res([]);
+        const st=db.transaction(STORE,'readonly').objectStore(STORE),out=[];let n=0;
+        [IDBKeyRange.upperBound(IMG_PREFIX,true),IDBKeyRange.lowerBound(IMG_PREFIX+'\uffff',true)].forEach(range=>{
+            const r=st.getAll(range);
+            r.onsuccess=()=>{out.push(...(r.result||[]));if(++n===2)res(out);};
+            r.onerror=()=>{if(++n===2)res(out);};
+        });
     });
     all.forEach(item=>_cache[item.key]=item.value);
     // Migrate old localStorage data once
@@ -722,13 +724,13 @@ function cacheGet(key){return key in _cache?_cache[key]:null;}
 // Parsed arrays are cached (keyed by the raw JSON string they came from) so reading
 // data — timers, counts, lists — never re-parses large image data. getArr returns a
 // shallow copy, so callers can push/splice/sort freely before saving with setArr.
-const _parsed={};
+const _parsed={},_corrupt=new Set();
 function getArr(key){
     const raw=cacheGet(key)||'[]',hit=_parsed[key];
     if(hit&&hit.raw===raw)return hit.val.slice();
     let val;
     try{val=JSON.parse(raw);if(!Array.isArray(val))val=[];}
-    catch(e){console.error('Corrupt data for',key,e);val=[];}
+    catch(e){console.error('Corrupt data for',key,e);val=[];_corrupt.add(key);}
     _parsed[key]={raw,val};
     return val.slice();
 }
@@ -736,6 +738,117 @@ function setArr(key,arr){
     const raw=JSON.stringify(arr);
     _parsed[key]={raw,val:arr.slice()};
     return dbSet(key,raw);
+}
+
+// ============================================================
+//  PHOTO STORE — every photo is its own record ("img:<id>") instead of being
+//  stored inside the entry lists. Lists stay small, so opening the app, saving,
+//  receiving and deleting never read or write megabytes of photo data.
+// ============================================================
+const IMG_PREFIX='img:';
+const PHOTO_LISTS=['filesOut','overdueFiles','returnedFiles','materialsOut','materialsOverdue','materialsReturned'];
+const isImgId=r=>typeof r==='string'&&r.startsWith(IMG_PREFIX);
+function newImgId(){return IMG_PREFIX+Date.now().toString(36)+Math.random().toString(36).slice(2,8).padEnd(6,'0');}
+function photoTx(mode,work){
+    return openDB().then(db=>new Promise((res,rej)=>{
+        const tx=db.transaction(STORE,mode),out=work(tx.objectStore(STORE));
+        tx.oncomplete=()=>res(out);
+        tx.onerror=()=>rej(tx.error);
+        tx.onabort=()=>rej(tx.error||new Error('Storage transaction aborted'));
+    }));
+}
+// Save photos (data URLs) in one transaction; returns their ids
+async function putImages(srcs){
+    const ids=srcs.map(()=>newImgId());
+    await photoTx('readwrite',st=>srcs.forEach((v,i)=>st.put({key:ids[i],value:v})));
+    return ids;
+}
+function getImages(ids){
+    if(!ids.length)return Promise.resolve([]);
+    return photoTx('readonly',st=>{
+        const out=new Array(ids.length);
+        ids.forEach((id,i)=>{const r=st.get(id);r.onsuccess=()=>{out[i]=r.result?r.result.value:null;};});
+        return out;
+    });
+}
+function deleteImages(ids){
+    ids=(ids||[]).filter(isImgId);
+    return ids.length?photoTx('readwrite',st=>ids.forEach(id=>st.delete(id))).catch(console.error):Promise.resolve();
+}
+// Photos of an entry / document / case. New items hold photo ids; items saved by
+// older versions (or restored from a backup before the move) hold the photo itself.
+function photoRefs(o){
+    if(!o)return[];
+    if(o.imageId)return[o.imageId];
+    if(Array.isArray(o.imageIds))return o.imageIds;
+    if(o.image)return[o.image];
+    if(Array.isArray(o.images)&&o.images.length)return o.images.filter(Boolean);
+    return o.data?[o.data]:[];
+}
+async function loadPhotos(o){
+    const refs=photoRefs(o),got=await getImages(refs.filter(isImgId));
+    let k=0;
+    return refs.map(r=>isImgId(r)?got[k++]:r).filter(Boolean);
+}
+// Moves photos out of lists into their own records. Returns the new (lighter) lists and
+// the photos to store. `stable` ids make an interrupted one-time move safe to repeat.
+function splitPhotos(data,stable){
+    const photos=[],out={};
+    const keep=(src,sid)=>{if(isImgId(src))return src;const id=stable?IMG_PREFIX+'m-'+sid:newImgId();photos.push({id,src});return id;};
+    const ids=(list,sid)=>(list||[]).filter(Boolean).map((src,k)=>keep(src,sid+'-'+k));
+    PHOTO_LISTS.forEach(k=>{if(data[k])out[k]=data[k].map(e=>{
+        if(!e||!('image' in e))return e;
+        const{image,...rest}=e;if(image)rest.imageId=keep(image,`${k}-${e.id}`);return rest;
+    });});
+    if(data.englishFile_folders)out.englishFile_folders=data.englishFile_folders.map((f,fi)=>({...f,documents:(f.documents||[]).map((d,di)=>{
+        if(!('images' in d)&&!('data' in d))return d;
+        const{images,data:legacy,...rest}=d;rest.imageIds=ids(images&&images.length?images:[legacy],`doc-${fi}-${di}`);return rest;
+    })}));
+    if(data.bailBonds)out.bailBonds=data.bailBonds.map((b,i)=>{
+        if(!('images' in b))return b;
+        const{images,...rest}=b;rest.imageIds=ids(images,`bail-${i}`);return rest;
+    });
+    if(data.record_folders)out.record_folders=data.record_folders.map((f,fi)=>({...f,cases:(f.cases||[]).map((c,ci)=>{
+        if(!('images' in c))return c;
+        const{images,hasImages,...rest}=c;rest.imageIds=ids(images,`rec-${fi}-${ci}`);return rest;
+    })}));
+    return{out,photos};
+}
+function putPhotoRecords(photos){
+    return photos.length?photoTx('readwrite',st=>photos.forEach(ph=>st.put({key:ph.id,value:ph.src}))):Promise.resolve();
+}
+const PHOTO_KEYS=[...PHOTO_LISTS,'englishFile_folders','bailBonds','record_folders'];
+// One time: move photos saved by older versions out of the lists. Photos are written first
+// and the lists only after that succeeds, so an interruption can never lose a photo.
+async function migratePhotosOnce(){
+    if(cacheGet('photosSplit'))return;
+    if(PHOTO_KEYS.some(k=>(cacheGet(k)||'').includes('data:image'))){
+        showLoading('Optimizing your data (one time)...');
+        try{
+            const data={};PHOTO_KEYS.forEach(k=>{data[k]=getArr(k);});
+            const{out,photos}=splitPhotos(data,true);
+            await putPhotoRecords(photos);
+            await Promise.all(PHOTO_KEYS.filter(k=>out[k]).map(k=>setArr(k,out[k])));
+        }finally{hideLoading();}
+    }
+    // keys left behind by older versions
+    ['processPending','processOverdue','processServed','docDupCleaned','meta_englishFile_folders','meta_record_folders']
+        .forEach(k=>{if(k in _cache)dbDelete(k).catch(console.error);});
+    await dbSet('photosSplit','1');
+}
+// Delete photo records that no entry refers to (after a failed save or a restore).
+// Photos from the last 10 minutes are skipped in case their entry is still being saved.
+async function cleanUnusedPhotos(){
+    if(!cacheGet('photosSplit'))return 0;
+    const used=new Set();
+    const add=o=>photoRefs(o).forEach(r=>used.add(r));
+    DATA_KEYS.forEach(k=>getArr(k).forEach(o=>{add(o);(o.documents||[]).forEach(add);(o.cases||[]).forEach(add);}));
+    if(_corrupt.size)return 0;  // never decide from data that couldn't be read
+    const keys=await photoTx('readonly',st=>{const r=st.getAllKeys(IDBKeyRange.bound(IMG_PREFIX,IMG_PREFIX+'\uffff'));const box={};r.onsuccess=()=>{box.keys=r.result||[];};return box;});
+    const now=Date.now();
+    const unused=(keys.keys||[]).filter(k=>{if(used.has(k))return false;const ts=parseInt(k.slice(IMG_PREFIX.length,-6),36);return!(ts&&now-ts<600000);});
+    if(unused.length)await deleteImages(unused);
+    return unused.length;
 }
 
 // ============================================================
@@ -767,8 +880,6 @@ function readAsDataURL(file){
     });
 }
 async function fileToCompressed(file){const d=await readAsDataURL(file);return d?compressImg(d):null;}
-// For My Documents - NO compression, preserve original quality
-function fileToOriginal(file){return readAsDataURL(file);}
 function pickImages(multiple,onPick){
     const input=document.createElement('input');
     input.type='file';input.accept='image/*';input.multiple=multiple;
@@ -795,9 +906,19 @@ function safeFileName(s){return String(s||'file').replace(/[\\/:*?"<>|]+/g,'_').
 // ============================================================
 //  UI FEEDBACK (loading + toast)
 // ============================================================
-function showLoading(txt='Saving...'){setLoadingText(txt);document.getElementById('loadingOverlay').classList.add('show');}
+// The dark "please wait" overlay only appears if the work takes longer than a moment,
+// so quick saves and app start no longer flash the screen. Taps are paused meanwhile.
+let _loadT=null,_busy=false;
+function showLoading(txt='Saving...'){
+    setLoadingText(txt);_busy=true;document.body.classList.add('busy');
+    clearTimeout(_loadT);
+    _loadT=setTimeout(()=>document.getElementById('loadingOverlay').classList.add('show'),350);
+}
 function setLoadingText(txt){document.getElementById('loadingText').textContent=txt;}
-function hideLoading(){document.getElementById('loadingOverlay').classList.remove('show');}
+function hideLoading(){
+    _busy=false;document.body.classList.remove('busy');
+    clearTimeout(_loadT);document.getElementById('loadingOverlay').classList.remove('show');
+}
 let _toastT=null;
 function toast(msg,type='info'){
     const t=document.getElementById('toast');
@@ -873,7 +994,7 @@ function isDayOrDateDur(dur){
     // Minutes/Hours = short duration; Days or custom date = long duration (show taken/returned dates)
     return !['5 Mins','15 Mins','30 Mins','1 Hour','2 Hours','3 Hours'].includes(dur);
 }
-function plural(n,word){return`${n} ${word}${n===1?'':'s'}`;}
+function plural(n,word){return`${n} ${n===1?word:word.endsWith('y')?word.slice(0,-1)+'ies':word+'s'}`;}
 
 // ============================================================
 //  NAVIGATION  (single source of truth: browser history)
@@ -915,7 +1036,7 @@ function closeTopOverlay(){
     return false;
 }
 window.addEventListener('popstate',()=>{
-    if(document.getElementById('loadingOverlay').classList.contains('show')){history.pushState({n:navStack.length},'');return;}
+    if(_busy){history.pushState({n:navStack.length},'');return;}
     if(closeTopOverlay()){history.pushState({n:navStack.length},'');return;}
     navBack();
 });
@@ -962,9 +1083,13 @@ function renderDetail(html,{listType=null,keepScroll=false}={}){
     if(dv._screen===screen&&dv.classList.contains('active'))keepScroll=true;
     dv._screen=screen;
     curDetailType=listType;
-    dv.innerHTML=`<div class="wrap">${html}</div>`;
+    const newScreen=!keepScroll&&dv.classList.contains('active');
+    // Reset the scroll BEFORE swapping content: done afterwards it forces the browser
+    // to lay out the whole new list immediately (a visible stutter on long lists)
+    if(!keepScroll&&dv.scrollTop)dv.scrollTop=0;
+    dv.innerHTML=`<div class="wrap${newScreen?' screen-in':''}">${html}</div>`;
     makeStickyTop(dv);
-    dv.scrollTop=keepScroll?top:0;
+    if(keepScroll)dv.scrollTop=top;
     hideDashboard();pageShow(dv);
     return dv;
 }
@@ -977,6 +1102,7 @@ document.addEventListener('DOMContentLoaded',async()=>{
     showLoading('Loading...');
     try{
         await dbLoadAll();
+        await migratePhotosOnce().catch(e=>console.error('Photo move failed (will retry next start)',e));
         applyTheme();loadSettings();renderDashboard();renderSidebar();
         await runOverdueChecks(true);
         loadCounts();
@@ -986,9 +1112,8 @@ document.addEventListener('DOMContentLoaded',async()=>{
         requestPersistentStorage();
         const openParam=new URLSearchParams(location.search).get('open');
         if(openParam){history.replaceState(null,'',location.pathname);openOverdueList(openParam);}
-        OBSOLETE_KEYS.forEach(k=>{if(k in _cache)dbDelete(k).catch(console.error);});
-        removeDuplicateDocImages();
         setupInstall();
+        setTimeout(()=>cleanUnusedPhotos().catch(console.error),5000);
     }catch(e){
         console.error(e);
         dash.innerHTML=`<div class="wrap"><div class="form-section"><h2 class="popup-title">Something went wrong</h2><p class="popup-sub">${esc(e&&e.message||e)}</p><button class="save-btn" style="width:100%" onclick="location.reload()">Reload</button></div></div>`;
@@ -1030,7 +1155,7 @@ function selectMode(m,t){
     if(m===curMode&&t===curType)return;
     curMode=m;curType=t;
     dbSet('currentMode',m).catch(console.error);dbSet('currentEntryType',t).catch(console.error);
-    renderDashboard();loadCounts();updateMenuSel();
+    renderDashboard(true);loadCounts();updateMenuSel();
 }
 function dashKey(){
     if(curMode==='office')return curType==='assignedTask'?'task':'material';
@@ -1065,31 +1190,22 @@ const DASH={
         ['bail-bonds','openBailBonds()','Bail Bonds','bailBonds','⚖️'],
         ['record','openRecord()','Record','record','📁']]}
 };
-function renderDashboard(){
+function renderDashboard(animate=false){
     const cfg=DASH[dashKey()];
     const cards=cfg.cards.map(([cls,onclick,lbl,key,icon])=>
         `<button class="card ${cls}" onclick="${onclick}" data-count="${key}"><div class="card-content"><h2>${lbl}</h2><div class="count" id="count-${key}">0</div></div><div class="card-icon" aria-hidden="true">${icon}</div></button>`).join('');
-    document.getElementById('mainDashboard').innerHTML=`<div class="wrap">
+    document.getElementById('mainDashboard').innerHTML=`<div class="wrap${animate?' screen-in':''}">
 <header class="header"><button class="menu-icon" onclick="openSidebar()" aria-label="Open menu"><span></span><span></span><span></span></button><div class="header-content"><h1>${cfg.title}</h1><div class="date" id="currentDate"></div></div><img class="header-logo" src="icon-192.png" alt="" width="36" height="36"></header>
 <div id="backupBanner"></div>${curMode==='fileMovement'?`<div class="mode-chip">${curType==='title'?'📝 Title Entry':'📷 Picture Entry'}</div>`:''}<div class="cards">${cards}</div>
 ${cfg.btn?`<button class="new-entry-btn" onclick="handleNewEntry()">＋ ${cfg.btn}</button>`:''}</div>`;
     updateDate();
 }
 function updateDate(){const el=document.getElementById('currentDate');if(el)el.textContent=new Date().toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'});}
-// Document/case totals are remembered next to the data (keyed by its size), so the
-// dashboard doesn't have to parse megabytes of images just to show a number
-function folderItemCount(key,field){
-    const raw=cacheGet(key)||'[]',metaKey='meta_'+key;
-    try{const m=JSON.parse(cacheGet(metaKey)||'null');if(m&&m.len===raw.length)return m.count;}catch(e){}
-    const count=getArr(key).reduce((n,f)=>n+(f[field]||[]).length,0);
-    dbSet(metaKey,JSON.stringify({len:raw.length,count})).catch(console.error);
-    return count;
-}
 function loadCounts(){
     const counts={};
     DATA_KEYS.forEach(k=>{if(!k.endsWith('_folders'))counts[k]=getArr(k).length;});
-    counts.englishFile=folderItemCount('englishFile_folders','documents');
-    counts.record=folderItemCount('record_folders','cases');
+    counts.englishFile=getArr('englishFile_folders').reduce((n,f)=>n+(f.documents||[]).length,0);
+    counts.record=getArr('record_folders').reduce((n,f)=>n+(f.cases||[]).length,0);
     document.querySelectorAll('#mainDashboard [data-count]').forEach(card=>{
         const key=card.dataset.count,v=counts[key]||0;
         const el=document.getElementById('count-'+key);if(el)el.textContent=v;
@@ -1345,6 +1461,11 @@ function baseEntry(expiresAt,person,mode){
     return{id:Date.now(),name:person.name,mobile:person.mobile,duration:DURATIONS[durIdx],
         createdAt:new Date().toISOString(),expiresAt,mode};
 }
+// Store the captured photo as its own record; null when there is no photo, false on error
+async function savePhoto(src){
+    if(!src)return null;
+    try{return(await putImages([src]))[0];}catch(e){toast('Could not save the picture: '+e.message,'error');return false;}
+}
 async function persistEntry(key,entry,msg){
     showLoading('Saving...');
     let ok=false;
@@ -1369,7 +1490,8 @@ async function saveMat(){
     const tb=gv('takenBy');if(!tb)return fail('Please fill all required fields!');
     const p=personValues();if(!p)return;
     const expAt=getDurExpiry();if(!expAt)return;
-    await persistEntry('materialsOut',{...baseEntry(expAt,p,'officeMaterial'),image,materialDetails:md,takenBy:tb},'Material entry saved');
+    const imageId=await savePhoto(image);if(imageId===false)return;
+    await persistEntry('materialsOut',{...baseEntry(expAt,p,'officeMaterial'),imageId,materialDetails:md,takenBy:tb},'Material entry saved');
 }
 async function saveFileMov(){
     let title,nature,image=null;
@@ -1379,7 +1501,8 @@ async function saveFileMov(){
     if(!df||!tb)return fail('Please fill all required fields!');
     const p=personValues();if(!p)return;
     const expAt=getDurExpiry();if(!expAt)return;
-    await persistEntry('filesOut',{...baseEntry(expAt,p,'fileMovement'),title,nature,dateField:df,takenBy:tb,image},'File entry saved');
+    const imageId=await savePhoto(image);if(imageId===false)return;
+    await persistEntry('filesOut',{...baseEntry(expAt,p,'fileMovement'),title,nature,dateField:df,takenBy:tb,imageId},'File entry saved');
 }
 
 // ============================================================
@@ -1432,7 +1555,7 @@ function filterList(inp){
 function openDetailView(type){pushNav('detailView',{type});_detailInternal(type);}
 function _detailInternal(type,keepScroll=false){
     const files=getArr(type).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
-    let html=viewHeader(esc(LIST_TITLES[type]||'Entries'),{sub:plural(files.length,'entry').replace('entrys','entries')});
+    let html=viewHeader(esc(LIST_TITLES[type]||'Entries'),{sub:plural(files.length,'entry')});
     if(!files.length)html+=emptyState('📂','No entries found');
     else html+=searchBox('Search name, title, mobile...')+files.map(f=>renderFileItem(f,type)).join('')+noResults();
     renderDetail(html,{listType:type,keepScroll});
@@ -1446,6 +1569,16 @@ function animateOut(el){
     return new Promise(r=>setTimeout(r,260));
 }
 function cardEl(sel){return document.querySelector('#detailView '+sel);}
+// Take one entry's card out of the open list without rebuilding the whole list
+function dropCard(id){
+    const dv=document.getElementById('detailView'),el=cardEl(`.file-item[data-id="${CSS.escape(String(id))}"]`);
+    if(!el){refreshDetail();return;}
+    el.remove();
+    const n=dv.querySelectorAll('.file-item').length;
+    if(!n){refreshDetail();return;}  // shows the "No entries" state
+    const sub=dv.querySelector('.view-header .date');if(sub)sub.textContent=plural(n,'entry');
+    const q=dv.querySelector('.search-input');if(q&&q.value)filterList(q);
+}
 function refreshDetail(){
     const dv=document.getElementById('detailView');
     if(!curDetailType||!dv.classList.contains('active'))return;
@@ -1465,7 +1598,7 @@ function renderFileItem(file,type){
     let banner='';
     if(file.title&&file.title!=='Image Captured')banner=`<div class="file-banner">${esc(file.title)}</div>`;
     else if(file.taskType)banner=`<div class="file-banner">${esc(label(file.taskType))}</div>`;
-    if(file.image)banner+=`<button class="file-banner picture-banner" onclick="showFileImg(${jsArg(type)},${jsArg(fid)})">🖼 View Picture</button>`;
+    if(file.imageId||file.image)banner+=`<button class="file-banner picture-banner" onclick="showFileImg(${jsArg(type)},${jsArg(fid)})">🖼 View Picture</button>`;
 
     // FILE INFO: hearing/decision date + nature
     let head='';
@@ -1506,14 +1639,14 @@ function renderFileItem(file,type){
                :`<button class="action-btn delete-btn" onclick="confirmDelete(${jsArg(fid)},${jsArg(type)},${jsArg(entryTitle)})">🗑 Delete</button>`);
     return`<article class="file-item" data-id="${esc(String(fid))}" data-s="${esc(search)}">${banner}${head}<div class="file-content"><div class="file-info">${info}</div>${warn}<div class="file-actions">${actions}</div></div></article>`;
 }
-function showFileImg(type,id){const f=getArr(type).find(x=>x.id===id);if(f&&f.image)showImgPrev(f.image);}
+async function showFileImg(type,id){const f=getArr(type).find(x=>x.id===id);const[src]=await loadPhotos(f);if(src)showImgPrev(src);}
 function showImgPrev(elOrSrc){
     const src=typeof elOrSrc==='string'?elOrSrc:(elOrSrc.querySelector('img')||elOrSrc).getAttribute('src');
     if(!src)return;
     document.getElementById('modalImage').src=src;
     document.getElementById('imageModal').classList.add('show');
 }
-function closeImageModal(){document.getElementById('imageModal').classList.remove('show');document.getElementById('modalImage').removeAttribute('src');}
+function closeImageModal(){const m=document.getElementById('imageModal');fadeOutCopy(m);m.classList.remove('show');document.getElementById('modalImage').removeAttribute('src');}
 function makeCall(m){if(m&&/^[0-9+]+$/.test(m))window.location.href='tel:'+m;}
 
 // ============================================================
@@ -1586,7 +1719,7 @@ async function saveEditedEntry(id,type){
         if(v.mobile&&!valMob(v.mobile))return fail('Mobile must be 11 digits starting with 03!');
     }
     const changes={...v};delete changes._due;
-    if(f.mode==='fileMovement'&&!v.title&&!f.image)return fail('Please enter the case title!');
+    if(f.mode==='fileMovement'&&!v.title&&!photoRefs(f).length)return fail('Please enter the case title!');
     const due=new Date(v._due);
     if(isNaN(due))return fail('Please enter a valid due date & time!');
     if(due.getTime()!==new Date(f.expiresAt).getTime()){changes.expiresAt=due.toISOString();changes.duration='Custom';}
@@ -1602,8 +1735,15 @@ async function saveEditedEntry(id,type){
         await Promise.all([setArr(pendingKey,lists[pendingKey]),setArr(overdueKey,lists[overdueKey])]);
         closePopup();
         toast(dst!==found.key?(dst===pendingKey?'✓ Updated — moved back to pending':'✓ Updated — now overdue'):'✓ Entry updated','success');
-    }catch(e){toast('Save failed: '+e.message,'error');}
-    refreshDetail();loadCounts();
+        // Update just this card: redraw it if it stays in the open list, otherwise slide it out
+        const el=cardEl(`.file-item[data-id="${CSS.escape(String(id))}"]`);
+        if(!el)refreshDetail();
+        else if(dst===curDetailType){
+            el.outerHTML=renderFileItem(updated,curDetailType);
+            const q=document.querySelector('#detailView .search-input');if(q&&q.value)filterList(q);
+        }else{await animateOut(el);dropCard(id);}
+    }catch(e){toast('Save failed: '+e.message,'error');refreshDetail();}
+    loadCounts();
 }
 
 // ============================================================
@@ -1625,13 +1765,14 @@ async function doReceive(id,type,extra={},msg=''){
         const[file]=arr.splice(idx,1);
         const now=new Date();
         const ret=getArr(target);
-        ret.push({...file,returnedAt:now.toISOString(),completedAt:now.toISOString(),...extra});
+        ret.push({...file,returnedAt:now.toISOString(),...extra});
         try{
             await Promise.all([setArr(key,arr),setArr(target,ret)]);
             await animateOut(cardEl(`.file-item[data-id="${CSS.escape(String(id))}"]`));
+            dropCard(id);
             toast(msg||(type.includes('Task')?'✓ Task marked complete':'✓ Marked as returned'),'success');
-        }catch(e){toast('Save failed: '+e.message,'error');}
-        refreshDetail();loadCounts();
+        }catch(e){toast('Save failed: '+e.message,'error');refreshDetail();}
+        loadCounts();
         return;
     }
     toast('Entry not found — it may have been updated.','error');
@@ -1643,12 +1784,15 @@ function confirmDelete(id,type,title){
 async function doDelete(id,type){
     if(!RETURNED_TYPES.includes(type))return;
     try{
-        await setArr(type,getArr(type).filter(f=>f.id!==id));
+        const list=getArr(type),gone=list.find(f=>f.id===id);
+        await setArr(type,list.filter(f=>f.id!==id));
+        deleteImages(photoRefs(gone));
         await animateOut(cardEl(`.file-item[data-id="${CSS.escape(String(id))}"]`));
+        dropCard(id);
         toast('Entry deleted','success');
     }
-    catch(e){toast('Delete failed: '+e.message,'error');}
-    refreshDetail();loadCounts();
+    catch(e){toast('Delete failed: '+e.message,'error');refreshDetail();}
+    loadCounts();
 }
 
 // ============================================================
@@ -1739,12 +1883,24 @@ async function saveNewPin(){
     finally{if(document.getElementById('pinSaveBtn'))btn.disabled=false;}
 }
 function closeConfirmPopup(){
-    document.getElementById('confirmPopup').classList.remove('active');
+    const cp=document.getElementById('confirmPopup');fadeOutCopy(cp);
+    cp.classList.remove('active');
     document.getElementById('passwordInput').value='';
     document.getElementById('confirmBtn').onclick=null;
 }
 function confirmWithPin(title,msg,onOk){showConfirmPopup(title,msg,onOk,true,{confirmText:'Delete',danger:true});}
-function closePopup(){const p=document.getElementById('entryPopup');p.classList.remove('active');p.innerHTML='';p._files=null;}
+// A short-lived copy fades out in place of the closing popup, so the real popup closes
+// (and can reopen) immediately — no timers to race with
+function fadeOutCopy(el){
+    if(!el.classList.contains('active')&&!el.classList.contains('show'))return;
+    const ghost=el.cloneNode(true);
+    ghost.removeAttribute('id');ghost.querySelectorAll('[id]').forEach(n=>n.removeAttribute('id'));
+    ghost.setAttribute('aria-hidden','true');ghost.classList.add('fading-out');
+    ghost.style.zIndex=(parseInt(getComputedStyle(el).zIndex,10)||3000)-1;
+    document.body.appendChild(ghost);
+    setTimeout(()=>ghost.remove(),200);
+}
+function closePopup(){const p=document.getElementById('entryPopup');fadeOutCopy(p);p.classList.remove('active');p.innerHTML='';p._files=null;}
 function showEntryPopup(html,wide=true){
     const p=document.getElementById('entryPopup');
     p.innerHTML=`<div class="popup-content${wide?' wide':''}" role="dialog" aria-modal="true">${html}</div>`;
@@ -1832,8 +1988,15 @@ async function shareContent(title,text,images,baseName){
         await navigator.share({title,text});
     }catch(e){if(e.name!=='AbortError')toast('Share failed: '+e.message,'error');}
 }
-function imgGallery(imgs){
-    return imgs.map((src,i)=>`<button type="button" class="gallery-img" onclick="showImgPrev(this)" aria-label="Open image ${i+1}"><img src="${esc(src)}" alt="Page ${i+1}" loading="lazy" decoding="async"></button>`).join('');
+// Photo slots are drawn empty and filled right after, so opening a document is instant
+// (no megabytes of photo data pass through the page HTML)
+function imgGallery(n){
+    return Array.from({length:n},(_,i)=>`<button type="button" class="gallery-img" onclick="showImgPrev(this)" aria-label="Open image ${i+1}"><img alt="Page ${i+1}" decoding="async"></button>`).join('');
+}
+async function fillGallery(dv,obj){
+    const screen=dv._screen,srcs=await loadPhotos(obj);
+    if(dv._screen!==screen)return;  // user already moved on
+    dv.querySelectorAll('.gallery-img img').forEach((img,i)=>{if(srcs[i])img.src=srcs[i];});
 }
 function attachLP(dv,selector,dataFn){dv.querySelectorAll(selector).forEach(c=>setupLP(c,dataFn(+c.dataset.idx)));}
 
@@ -1867,7 +2030,7 @@ function openEnglishFolder(fi,fromBack){
     let html=viewHeader(esc(folder.name),{sub:plural(docs.length,'document'),action:addBtn(`addEngPics(${fi})`,'Add document')});
     if(!docs.length)html+=emptyState('📄','No documents yet','Tap + to add pictures as a document.');
     else html+=searchBox('Search documents...');
-    html+=docs.map((d,di)=>`<div class="document-card" data-idx="${di}" data-s="${esc((d.name||'').toLowerCase())}" onclick="viewEngDoc(${fi},${di})"><div class="doc-icon">🖼️</div><div class="doc-info"><div class="doc-name">${esc(d.name)}</div><div class="doc-date">${fmtDate(d.createdAt)} • ${plural((d.images||(d.data?[d.data]:[])).length,'image')}</div></div><div class="folder-arrow">›</div></div>`).join('');
+    html+=docs.map((d,di)=>`<div class="document-card" data-idx="${di}" data-s="${esc((d.name||'').toLowerCase())}" onclick="viewEngDoc(${fi},${di})"><div class="doc-icon">🖼️</div><div class="doc-info"><div class="doc-name">${esc(d.name)}</div><div class="doc-date">${fmtDate(d.createdAt)} • ${plural(photoRefs(d).length,'image')}</div></div><div class="folder-arrow">›</div></div>`).join('');
     if(docs.length)html+=noResults()+hint('Tap to view • Long press for options');
     attachLP(renderDetail(html),'.document-card',di=>({type:'document',category:'englishFile',folderIndex:fi,docIndex:di}));
 }
@@ -1888,12 +2051,13 @@ async function engDocSaveAll(fi){
     closePopup();
     showLoading('Loading images...');
     try{
-        const images=await processImages(files,fileToOriginal);
+        const images=await processImages(files,readAsDataURL);  // original quality for documents
         if(!images.length)throw new Error('No valid images found!');
         setLoadingText('Saving document...');
         const folders=engFolders();
         if(!folders[fi])throw new Error('Folder not found');
-        (folders[fi].documents=folders[fi].documents||[]).push({name:title,images,createdAt:new Date().toISOString()});
+        const imageIds=await putImages(images);
+        (folders[fi].documents=folders[fi].documents||[]).push({name:title,imageIds,createdAt:new Date().toISOString()});
         await setArr('englishFile_folders',folders);
         openEnglishFolder(fi,true);loadCounts();toast('✓ Document saved','success');
     }catch(e){toast(e.message.startsWith('No valid')?e.message:'Save failed: '+e.message,'error');}
@@ -1903,8 +2067,8 @@ function viewEngDoc(fi,di,fromBack){
     const folder=engFolders()[fi],doc=folder&&(folder.documents||[])[di];
     if(!doc){toast('Document not found','error');return;}
     if(!fromBack)pushNav('engDoc',{fi,di});
-    const imgs=(doc.images||[doc.data]).filter(Boolean);
-    renderDetail(viewHeader(esc(doc.name),{sub:`${esc(folder.name)} • ${plural(imgs.length,'image')}`})+imgGallery(imgs));
+    const n=photoRefs(doc).length;
+    fillGallery(renderDetail(viewHeader(esc(doc.name),{sub:`${esc(folder.name)} • ${plural(n,'image')}`})+imgGallery(n)),doc);
 }
 function editFolder(cat,fi){
     if(cat==='record'){createRecFolder(fi);return;}
@@ -1919,8 +2083,8 @@ function deleteFolder(cat,fi){
     const sk=cat+'_folders',f=getArr(sk)[fi];if(!f)return;
     const nm=cat==='record'?`${f.month} ${f.year}`:f.name;
     confirmWithPin('Delete Folder',`Delete "${nm}" and all its contents? Enter your PIN to confirm.`,async()=>{
-        const folders=getArr(sk);folders.splice(fi,1);
-        try{await setArr(sk,folders);await animateOut(cardEl(`.folder-card[data-idx="${fi}"]`));toast('Folder deleted','success');}catch(e){toast('Delete failed: '+e.message,'error');}
+        const folders=getArr(sk),[gone]=folders.splice(fi,1);
+        try{await setArr(sk,folders);deleteImages([...(gone.documents||[]),...(gone.cases||[])].flatMap(photoRefs));await animateOut(cardEl(`.folder-card[data-idx="${fi}"]`));toast('Folder deleted','success');}catch(e){toast('Delete failed: '+e.message,'error');}
         if(cat==='englishFile')openEnglishFile(true);else openRecord(true);
         loadCounts();
     });
@@ -1936,14 +2100,14 @@ function editDocument(cat,fi,di){
 function deleteDocument(cat,fi,di){
     const doc=(engFolders()[fi]||{documents:[]}).documents[di];if(!doc)return;
     confirmWithPin('Delete Document',`Delete "${doc.name}"? Enter your PIN to confirm.`,async()=>{
-        const folders=engFolders();folders[fi].documents.splice(di,1);
-        try{await setArr('englishFile_folders',folders);await animateOut(cardEl(`.document-card[data-idx="${di}"]`));toast('Document deleted','success');}catch(e){toast('Delete failed: '+e.message,'error');}
+        const folders=engFolders(),[gone]=folders[fi].documents.splice(di,1);
+        try{await setArr('englishFile_folders',folders);deleteImages(photoRefs(gone));await animateOut(cardEl(`.document-card[data-idx="${di}"]`));toast('Document deleted','success');}catch(e){toast('Delete failed: '+e.message,'error');}
         openEnglishFolder(fi,true);loadCounts();
     });
 }
-function shareDocument(cat,fi,di){
+async function shareDocument(cat,fi,di){
     const doc=(engFolders()[fi]||{documents:[]}).documents[di];if(!doc)return;
-    const imgs=(doc.images||[doc.data]).filter(Boolean);
+    const imgs=await loadPhotos(doc);
     shareContent(doc.name,`Document: ${doc.name}\n${plural(imgs.length,'image')}`,imgs,doc.name);
 }
 
@@ -1958,7 +2122,7 @@ function openBailBonds(fromBack){
     else html+=searchBox('Search by FIR, Police Station...');
     html+=bonds.map((b,i)=>{
         const sd=[b.title,b.firNumber,b.firYear,b.policeStation].join(' ').toLowerCase();
-        return`<div class="document-card" data-idx="${i}" data-s="${esc(sd)}" onclick="viewBailBond(${i})"><div class="doc-icon">⚖️</div><div class="doc-info"><div class="doc-name">${esc(b.title)}</div><div class="doc-date">${esc(b.policeStation)}</div><div class="doc-date">${fmtDate(b.createdAt)} • ${plural((b.images||[]).length,'image')}</div></div><div class="folder-arrow">›</div></div>`;
+        return`<div class="document-card" data-idx="${i}" data-s="${esc(sd)}" onclick="viewBailBond(${i})"><div class="doc-icon">⚖️</div><div class="doc-info"><div class="doc-name">${esc(b.title)}</div><div class="doc-date">${esc(b.policeStation)}</div><div class="doc-date">${fmtDate(b.createdAt)} • ${plural(photoRefs(b).length,'image')}</div></div><div class="folder-arrow">›</div></div>`;
     }).join('');
     if(bonds.length)html+=noResults()+hint('Tap to view • Long press for options');
     attachLP(renderDetail(html),'.document-card',i=>({type:'bailBond',index:i}));
@@ -1985,7 +2149,8 @@ async function saveBailBond(){
         const images=await processImages(files,fileToCompressed);
         if(!images.length)throw new Error('No valid images found!');
         const bonds=getArr('bailBonds');
-        bonds.push({title:`FIR ${fir}/${yr}`,firNumber:fir,firYear:yr,policeStation:ps,images,createdAt:new Date().toISOString()});
+        const imageIds=await putImages(images);
+        bonds.push({title:`FIR ${fir}/${yr}`,firNumber:fir,firYear:yr,policeStation:ps,imageIds,createdAt:new Date().toISOString()});
         await setArr('bailBonds',bonds);
         openBailBonds(true);loadCounts();toast('✓ Bail bond saved','success');
     }catch(e){toast('Save failed: '+e.message,'error');}
@@ -1995,22 +2160,22 @@ function viewBailBond(i,fromBack){
     const b=getArr('bailBonds')[i];
     if(!b){toast('Bail bond not found','error');return;}
     if(!fromBack)pushNav('bailBond',{i});
-    const imgs=b.images||[];
-    renderDetail(viewHeader(esc(b.title),{sub:plural(imgs.length,'image')})+
+    const n=photoRefs(b).length;
+    fillGallery(renderDetail(viewHeader(esc(b.title),{sub:plural(n,'image')})+
         `<div class="kv"><div class="kv-row"><span>FIR</span><strong>${esc(b.firNumber)}/${esc(b.firYear)}</strong></div><div class="kv-row"><span>Police Station</span><strong>${esc(b.policeStation)}</strong></div><div class="kv-row"><span>Added</span><strong>${fmtDate(b.createdAt)}</strong></div></div>`+
-        imgGallery(imgs));
+        imgGallery(n)),b);
 }
 function deleteBailBond(i){
     const b=getArr('bailBonds')[i];if(!b)return;
     confirmWithPin('Delete Bail Bond',`Delete "${b.title}"? Enter your PIN to confirm.`,async()=>{
-        const bonds=getArr('bailBonds');bonds.splice(i,1);
-        try{await setArr('bailBonds',bonds);await animateOut(cardEl(`.document-card[data-idx="${i}"]`));toast('Bail bond deleted','success');}catch(e){toast('Delete failed: '+e.message,'error');}
+        const bonds=getArr('bailBonds'),[gone]=bonds.splice(i,1);
+        try{await setArr('bailBonds',bonds);deleteImages(photoRefs(gone));await animateOut(cardEl(`.document-card[data-idx="${i}"]`));toast('Bail bond deleted','success');}catch(e){toast('Delete failed: '+e.message,'error');}
         openBailBonds(true);loadCounts();
     });
 }
-function shareBailBond(i){
+async function shareBailBond(i){
     const b=getArr('bailBonds')[i];if(!b)return;
-    const imgs=b.images||[];
+    const imgs=await loadPhotos(b);
     shareContent(b.title,`FIR: ${b.firNumber}/${b.firYear}\nPolice Station: ${b.policeStation}\n${plural(imgs.length,'image')}`,imgs,`FIR_${b.firNumber}`);
 }
 
@@ -2084,7 +2249,8 @@ function addRecPic(fi){
             if(!images.length)throw new Error('No valid images found!');
             const folders=recFolders();
             if(!folders[fi])throw new Error('Folder not found');
-            (folders[fi].cases=folders[fi].cases||[]).push({title:'Picture Entry '+new Date().toLocaleString(),caseType:'picture',images,hasImages:true,pages:images.length,createdAt:new Date().toISOString()});
+            const imageIds=await putImages(images);
+            (folders[fi].cases=folders[fi].cases||[]).push({title:'Picture Entry '+new Date().toLocaleString(),caseType:'picture',imageIds,pages:images.length,createdAt:new Date().toISOString()});
             await setArr('record_folders',folders);
             openRecordFolder(fi,true);loadCounts();toast('✓ Pictures saved','success');
         }catch(e){toast('Save failed: '+e.message,'error');}
@@ -2142,9 +2308,9 @@ function viewRecCase(fi,ci,fromBack){
     const folder=recFolders()[fi],cd=folder&&(folder.cases||[])[ci];
     if(!cd){toast('Case not found','error');return;}
     if(!fromBack)pushNav('recCase',{fi,ci});
-    const imgs=cd.hasImages&&cd.images?cd.images:[];
+    const n=photoRefs(cd).length;
     if(cd.caseType==='picture'){
-        renderDetail(viewHeader('Picture Entry',{sub:`${esc(folder.month)} ${esc(folder.year)} • ${plural(imgs.length,'image')}`})+imgGallery(imgs));
+        fillGallery(renderDetail(viewHeader('Picture Entry',{sub:`${esc(folder.month)} ${esc(folder.year)} • ${plural(n,'image')}`})+imgGallery(n)),cd);
         return;
     }
     const row=(k,v)=>`<div class="kv-row"><span>${k}</span><strong>${v}</strong></div>`;
@@ -2153,7 +2319,7 @@ function viewRecCase(fi,ci,fromBack){
     if(cd.caseType==='criminal')info+=row('FIR',`${esc(cd.firNumber||'')}/${esc(cd.firYear||'')}`)+row('Offence',esc(cd.offence||''))+row('Police Station',esc(cd.policeStation||''));
     else info+=row('Nature',esc(cd.nature||''));
     info+=row('Decision Date',fmtDate(cd.decisionDate))+row('Pages',esc(String(cd.pages||0)))+row('Judge',esc(folder.judgeName));
-    renderDetail(viewHeader(esc(cd.title),{sub:`${esc(folder.month)} ${esc(folder.year)}`})+`<div class="kv">${info}</div>`+imgGallery(imgs));
+    fillGallery(renderDetail(viewHeader(esc(cd.title),{sub:`${esc(folder.month)} ${esc(folder.year)}`})+`<div class="kv">${info}</div>`+imgGallery(n)),cd);
 }
 function editRecordCase(fi,ci){
     const cd=(recFolders()[fi]||{cases:[]}).cases[ci];if(!cd)return;
@@ -2172,14 +2338,14 @@ async function updateRecCase(fi,ci){
 function deleteRecordCase(fi,ci){
     const cd=(recFolders()[fi]||{cases:[]}).cases[ci];if(!cd)return;
     confirmWithPin('Delete Case',`Delete "${cd.title}"? Enter your PIN to confirm.`,async()=>{
-        const folders=recFolders();folders[fi].cases.splice(ci,1);
-        try{await setArr('record_folders',folders);await animateOut(cardEl(`.document-card[data-idx="${ci}"]`));toast('Case deleted','success');}catch(e){toast('Delete failed: '+e.message,'error');}
+        const folders=recFolders(),[gone]=folders[fi].cases.splice(ci,1);
+        try{await setArr('record_folders',folders);deleteImages(photoRefs(gone));await animateOut(cardEl(`.document-card[data-idx="${ci}"]`));toast('Case deleted','success');}catch(e){toast('Delete failed: '+e.message,'error');}
         openRecordFolder(fi,true);loadCounts();
     });
 }
-function shareRecordCase(fi,ci){
+async function shareRecordCase(fi,ci){
     const fld=recFolders()[fi],cd=fld&&(fld.cases||[])[ci];if(!cd)return;
-    if(cd.caseType==='picture'){shareContent('Picture Entry','Picture Entry',cd.images||[],'Record');return;}
+    if(cd.caseType==='picture'){shareContent('Picture Entry','Picture Entry',await loadPhotos(cd),'Record');return;}
     let text=`Title: ${cd.title}\nCase Type: ${cd.caseType}`;
     if(cd.goshwaraNumber)text+=`\nGoshwara No: ${cd.goshwaraNumber}`;
     if(cd.caseType==='criminal')text+=`\nFIR: ${cd.firNumber}/${cd.firYear}\nPolice Station: ${cd.policeStation}\nOffence: ${cd.offence||''}`;
@@ -2204,13 +2370,13 @@ function updateAlertState(){
 }
 // Short two-tone chime. Browsers only allow sound after the user has tapped the page,
 // so the audio engine is unlocked on the first tap.
+// Created on first use (browsers allow sound once the user has tapped the page at least once)
 let _audio=null;
-document.addEventListener('pointerdown',()=>{
-    if(_audio)return;
-    try{_audio=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}
-},{once:true,capture:true});
 function playChime(){
-    if(!_audio)return;
+    if(!_audio){
+        if(navigator.userActivation&&!navigator.userActivation.hasBeenActive)return;
+        try{_audio=new (window.AudioContext||window.webkitAudioContext)();}catch(e){return;}
+    }
     try{
         if(_audio.state==='suspended')_audio.resume();
         const t=_audio.currentTime;
@@ -2395,9 +2561,21 @@ function updateBackupBanner(){
     const lt=document.getElementById('lastBackupText');if(lt)lt.textContent=lastBackupText();
 }
 function snoozeBackup(){dbSet('backupSnoozeUntil',String(Date.now()+86400000)).catch(console.error);updateBackupBanner();}
-function backupJSON(){
+// Backups keep the photos inside the file (same format as older versions), so a backup
+// restores on any version and on any phone
+async function backupJSON(){
     const data={app:'Muhafiz',exportDate:new Date().toISOString()};
-    DATA_KEYS.forEach(k=>{data[k]=getArr(k);});
+    const inline=async o=>{
+        if(o&&o.imageId){const{imageId,...rest}=o;rest.image=(await getImages([imageId]))[0]||null;return rest;}
+        if(o&&Array.isArray(o.imageIds)){const{imageIds,...rest}=o;rest.images=(await getImages(imageIds)).filter(Boolean);if(o.caseType==='picture')rest.hasImages=true;return rest;}
+        return o;
+    };
+    for(const k of DATA_KEYS){
+        const list=getArr(k);
+        data[k]=k==='englishFile_folders'?await Promise.all(list.map(async f=>({...f,documents:await Promise.all((f.documents||[]).map(inline))})))
+            :k==='record_folders'?await Promise.all(list.map(async f=>({...f,cases:await Promise.all((f.cases||[]).map(inline))})))
+            :await Promise.all(list.map(inline));
+    }
     return JSON.stringify(data);
 }
 async function markBackupDone(){
@@ -2422,7 +2600,7 @@ async function shareBackup(){
     const name=`muhafiz-backup-${todayISO()}`;
     showLoading('Preparing backup...');
     let json;
-    try{json=backupJSON();}catch(e){hideLoading();toast('Backup failed: '+e.message,'error');return;}
+    try{json=await backupJSON();}catch(e){hideLoading();toast('Backup failed: '+e.message,'error');return;}
     hideLoading();
     // Some Android versions only allow sharing .txt files; restore accepts both
     let file=new File([json],name+'.json',{type:'application/json'});
@@ -2431,18 +2609,31 @@ async function shareBackup(){
     try{
         await navigator.share({files:[file],title:'Muhafiz Backup'});
         closePopup();await markBackupDone();toast('✓ Backup shared','success');
-    }catch(e){if(e.name!=='AbortError')toast('Share failed: '+e.message,'error');}
+    }catch(e){
+        if(e.name==='NotAllowedError'){offerShare(file);return;}  // took too long after the tap — ask for one more tap
+        if(e.name!=='AbortError')toast('Share failed: '+e.message,'error');
+    }
+}
+function offerShare(file){
+    showEntryPopup(`<h2 class="popup-title">💾 Backup ready</h2><p class="popup-sub">Tap Share to send it to WhatsApp or Google Drive.</p>
+<div class="popup-actions"><button class="popup-cancel" onclick="closePopup()">Cancel</button><button class="popup-confirm" id="shareReadyBtn">📤 Share</button></div>`,false);
+    document.getElementById('shareReadyBtn').onclick=async()=>{
+        try{await navigator.share({files:[file],title:'Muhafiz Backup'});closePopup();await markBackupDone();toast('✓ Backup shared','success');}
+        catch(e){if(e.name!=='AbortError')toast('Share failed: '+e.message,'error');}
+    };
 }
 async function downloadBackup(){
+    showLoading('Preparing backup...');
     try{
-        const blob=new Blob([backupJSON()],{type:'application/json'});
+        const blob=new Blob([await backupJSON()],{type:'application/json'});
+        hideLoading();
         const url=URL.createObjectURL(blob);
         const a=document.createElement('a');
         a.href=url;a.download=`muhafiz-backup-${todayISO()}.json`;
         document.body.appendChild(a);a.click();a.remove();
         setTimeout(()=>URL.revokeObjectURL(url),10000);
         closePopup();await markBackupDone();toast('✓ Backup downloaded','success');
-    }catch(e){toast('Backup failed: '+e.message,'error');}
+    }catch(e){hideLoading();toast('Backup failed: '+e.message,'error');}
 }
 function importData(){closeSidebar();document.getElementById('importFileInput').click();}
 function handleImportFile(e){
@@ -2460,7 +2651,12 @@ function handleImportFile(e){
         showConfirmPopup('Import Data',`This will replace your current data${when}. Continue?`,async()=>{
             showLoading('Importing data...');
             try{
-                for(const k of keys)await setArr(k,data[k]);
+                const picked={};keys.forEach(k=>{picked[k]=data[k];});
+                const{out,photos}=splitPhotos(picked,false);
+                await putPhotoRecords(photos);  // photos first, then the lists that point to them
+                for(const k of keys)await setArr(k,out[k]||picked[k]);
+                await migratePhotosOnce();  // no-op normally; finishes any lists not in the backup
+                cleanUnusedPhotos().catch(console.error);  // photos of the replaced data
                 await runOverdueChecks();
                 loadCounts();toast('✓ Data imported successfully','success');
             }catch(err){toast('Import failed: '+err.message,'error');}
@@ -2475,11 +2671,15 @@ function handleImportFile(e){
 // ============================================================
 // The app opens instantly from the phone's saved copy; a newer version is downloaded
 // in the background and the user is offered a one-tap update.
+function applyUpdate(){
+    document.body.classList.add('leaving');  // fade to the background, then load the new version
+    setTimeout(()=>location.reload(),180);
+}
 function showUpdateBar(){
     if(document.getElementById('updateBar'))return;
     const bar=document.createElement('div');
     bar.id='updateBar';bar.className='update-bar';bar.setAttribute('role','status');
-    bar.innerHTML='<span>🔄 A new version of the app is ready</span><button onclick="location.reload()">Update</button><button class="ub-close" onclick="this.parentElement.remove()" aria-label="Later">×</button>';
+    bar.innerHTML='<span>🔄 A new version of the app is ready</span><button onclick="applyUpdate()">Update</button><button class="ub-close" onclick="this.parentElement.remove()" aria-label="Later">×</button>';
     document.body.appendChild(bar);
 }
 if('serviceWorker' in navigator){
