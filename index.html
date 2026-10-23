@@ -299,6 +299,7 @@
         .bb-actions button{flex:1;padding:10px;border-radius:10px;font-weight:700;font-size:14px;cursor:pointer;}
         .bb-primary{background:var(--accent);color:#fff;border:none;}
         .bb-later{background:var(--surface);color:var(--text);border:1px solid var(--border);}
+        .link-btn{border:none;background:none;padding:0;font:inherit;font-weight:700;color:var(--accent-text);text-decoration:underline;cursor:pointer;}
         .menu-badge{margin-left:auto;font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:999px;background:var(--surface-2);color:var(--text-2);}
         .menu-badge.on{background:var(--green-soft);color:var(--green);}
         .menu-badge.off{background:var(--red-soft);color:var(--red);}
@@ -2370,15 +2371,17 @@ function updateAlertState(){
 }
 // Short two-tone chime. Browsers only allow sound after the user has tapped the page,
 // so the audio engine is unlocked on the first tap.
-// Created on first use (browsers allow sound once the user has tapped the page at least once)
+// Created on first use. Browsers only allow sound after the screen has been tapped at
+// least once since the app opened. Resolves true if the chime actually played.
 let _audio=null;
-function playChime(){
+async function playChime(){
     if(!_audio){
-        if(navigator.userActivation&&!navigator.userActivation.hasBeenActive)return;
-        try{_audio=new (window.AudioContext||window.webkitAudioContext)();}catch(e){return;}
+        if(navigator.userActivation&&!navigator.userActivation.hasBeenActive)return false;
+        try{_audio=new (window.AudioContext||window.webkitAudioContext)();}catch(e){return false;}
     }
     try{
-        if(_audio.state==='suspended')_audio.resume();
+        if(_audio.state!=='running')await Promise.race([_audio.resume(),new Promise(r=>setTimeout(r,300))]);
+        if(_audio.state!=='running')return false;
         const t=_audio.currentTime;
         [[880,0],[660,0.22],[880,0.44]].forEach(([f,d])=>{
             const o=_audio.createOscillator(),g=_audio.createGain();
@@ -2386,7 +2389,23 @@ function playChime(){
             g.gain.setValueAtTime(0.0001,t+d);g.gain.exponentialRampToValueAtTime(0.35,t+d+0.02);g.gain.exponentialRampToValueAtTime(0.0001,t+d+0.2);
             o.connect(g).connect(_audio.destination);o.start(t+d);o.stop(t+d+0.22);
         });
-    }catch(e){}
+        return true;
+    }catch(e){return false;}
+}
+// Phone notification for overdue entries — the phone plays its own tone and vibration,
+// which (unlike in-app sound) is allowed even before the screen has been tapped
+async function phoneNotify(title,body,openKey){
+    if(!NOTIF_OK||Notification.permission!=='granted')return false;
+    try{
+        const reg=await navigator.serviceWorker.ready;
+        await reg.showNotification(title,{body,icon:'icon-192.png',badge:'icon-192.png',tag:'overdue-'+Date.now(),
+            renotify:true,requireInteraction:true,vibrate:[250,120,250],data:{openKey}});
+        return true;
+    }catch(e){console.warn('Notification failed',e);return false;}
+}
+// Remove overdue notifications once the user has seen the alert inside the app
+async function clearOverdueNotes(){
+    try{(await (await navigator.serviceWorker.ready).getNotifications()).forEach(n=>{if((n.tag||'').startsWith('overdue-'))n.close();});}catch(e){}
 }
 function overdueLine({item,key}){
     const what=OVERDUE_WHAT[key]||'entry';
@@ -2404,25 +2423,25 @@ async function alertOverdue(moved){
     const body=moved.slice(0,3).map(overdueLine).join('\n')+(moved.length>3?`\n+${moved.length-3} more`:'');
     const openKey=moved.every(m=>m.key===first.key)?first.key:'overdueFiles';
     if(document.visibilityState==='visible'){
-        // App on screen: in-app alert + chime + vibration
-        playChime();
-        if(navigator.vibrate)navigator.vibrate([250,120,250]);
+        // App on screen: alert popup + chime + vibration. Right after the app (re)opens the
+        // browser blocks in-app sound and vibration until the screen is tapped — then the
+        // phone's own notification rings and vibrates instead.
+        const rang=await playChime();
+        if(rang&&navigator.vibrate)navigator.vibrate([250,120,250]);
+        const silent=!rang&&!(await phoneNotify(title,body,openKey));
         if(document.getElementById('entryPopup').classList.contains('active')||document.getElementById('confirmPopup').classList.contains('active')){
             toast(title+' — '+overdueLine(first),'error');return;
         }
+        const soundHint=silent&&NOTIF_OK&&Notification.permission!=='granted'
+            ?`<p class="popup-sub">🔕 No tone or vibration because notifications are off. <button class="link-btn" onclick="requestAlerts()">Turn on</button></p>`:'';
         showEntryPopup(`<div style="text-align:center"><div style="font-size:44px;margin-bottom:6px">⏰</div><h2 class="popup-title">${esc(title.replace(/^⏰\s*/,''))}</h2></div>
-<div class="kv">${moved.slice(0,5).map(m=>`<div class="kv-row"><strong style="text-align:left">${esc(overdueLine(m))}</strong></div>`).join('')}${moved.length>5?`<div class="kv-row"><span>+${moved.length-5} more</span></div>`:''}</div>
-<div class="popup-actions"><button class="popup-cancel" onclick="closePopup()">OK</button><button class="popup-confirm" onclick="closePopup();openOverdueList('${openKey}')">View</button></div>`,false);
+<div class="kv">${moved.slice(0,5).map(m=>`<div class="kv-row"><strong style="text-align:left">${esc(overdueLine(m))}</strong></div>`).join('')}${moved.length>5?`<div class="kv-row"><span>+${moved.length-5} more</span></div>`:''}</div>${soundHint}
+<div class="popup-actions"><button class="popup-cancel" onclick="closePopup();clearOverdueNotes()">OK</button><button class="popup-confirm" onclick="closePopup();clearOverdueNotes();openOverdueList('${openKey}')">View</button></div>`,false);
         return;
     }
-    // App in the background: phone notification (the phone plays its notification tone).
-    // Without permission, keep them and show the in-app alert when the user comes back.
-    if(!NOTIF_OK||Notification.permission!=='granted'){_pendingAlerts.push(...moved);return;}
-    try{
-        const reg=await navigator.serviceWorker.ready;
-        await reg.showNotification(title,{body,icon:'icon-192.png',badge:'icon-192.png',tag:'overdue-'+Date.now(),
-            renotify:true,requireInteraction:true,vibrate:[250,120,250],data:{openKey}});
-    }catch(e){console.warn('Notification failed',e);}
+    // App in the background: phone notification. Without permission, keep the alerts
+    // and show them inside the app when the user comes back.
+    if(!(await phoneNotify(title,body,openKey)))_pendingAlerts.push(...moved);
 }
 // Open the right dashboard + overdue list (from the alert popup or a notification tap)
 function openOverdueList(key){
@@ -2465,7 +2484,7 @@ ${on?`<p class="popup-sub">When an entry becomes overdue:<br>• App on screen �
 }
 async function testAlert(){
     closePopup();
-    playChime();if(navigator.vibrate)navigator.vibrate([250,120,250]);
+    if(await playChime()&&navigator.vibrate)navigator.vibrate([250,120,250]);
     try{(await navigator.serviceWorker.ready).showNotification('⏰ Test: File overdue',{body:'This is how an overdue alert looks.',icon:'icon-192.png',badge:'icon-192.png',tag:'test',vibrate:[250,120,250],data:{openKey:'overdueFiles'}});}catch(e){toast('Could not show notification','error');}
 }
 
